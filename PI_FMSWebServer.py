@@ -9,26 +9,18 @@ FMS Web Server
 
 Architecture:
 
-    HTTP thread
-        |
-        | GET /fms
-        v
-    thread-safe cache
-        ^
-        |
-        | update
-        |
-    X-Plane flight loop
-        |
-        v
-    XPPython3 / X-Plane API
+    HTTP thread -> thread-safe request queue -> X-Plane flight loop
+                                      <- response queue
 
 IMPORTANT:
     No X-Plane API is called from the HTTP thread.
 """
 
 import json
+import os
+import queue
 import threading
+from functools import partial
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -41,55 +33,27 @@ from XPPython3 import xp
 HOST = "127.0.0.1"
 PORT = 8201
 
-# How often to update the FMS cache.
+# How often to service requests from the HTTP thread.
 #
 # 0.25 = 4 times per second
 # 0.5  = 2 times per second
 #
 # For an FMS web API 0.25-0.5 is normally more than enough.
 FMS_UPDATE_INTERVAL = 0.25
+XPLANE_REQUEST_TIMEOUT = 10.0
+MAX_HTTP_BODY_SIZE = 64 * 1024
 
 
-# ============================================================
-# Shared FMS cache
-# ============================================================
-
-class FMSCache:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._data = {
-            "valid": False,
-            "count": 0,
-            "destination_index": -1,
-            "waypoints": []
-        }
-        self._version = 0
-
-    def update(self, data):
-        # Make sure the HTTP thread never sees a partially
-        # modified Python object.
-        with self._lock:
-            self._data = data
-            self._version += 1
-
-    def get(self):
-        with self._lock:
-            # JSON-compatible structures consisting of
-            # dict/list/int/float/string/bool/None are safe
-            # to copy this way.
-            return json.loads(
-                json.dumps(
-                    self._data,
-                    ensure_ascii=False
-                )
-            )
-
-    def version(self):
-        with self._lock:
-            return self._version
+# Requests are created by HTTP worker threads and consumed by the
+# X-Plane flight loop.  The response queue belongs to one request only.
+class XPlaneRequest:
+    def __init__(self, function):
+        self.function = function
+        self.response = queue.Queue(maxsize=1)
 
 
-fms_cache = FMSCache()
+xplane_requests = queue.Queue()
+processed_request_count = 0
 
 # ============================================================
 # Navigation type
@@ -162,6 +126,117 @@ def read_fms_from_xplane():
     }
 
 
+def fms_directory():
+    return os.path.normpath(
+        os.path.join(
+            xp.getSystemPath(),
+            "Output",
+            "FMS plans"
+        )
+    )
+
+
+def list_fms_files_from_xplane():
+    directory = fms_directory()
+    if not os.path.isdir(directory):
+        return []
+
+    return sorted(
+        name for name in os.listdir(directory)
+        if name.lower().endswith(".fms")
+        and os.path.isfile(os.path.join(directory, name))
+    )
+
+
+def get_fms_files_from_xplane():
+    return {"files": list_fms_files_from_xplane()}
+
+
+def parse_fms_file(path):
+    entries = []
+    with open(path, "r", encoding="utf-8-sig") as fms_file:
+        for line in fms_file:
+            fields = line.strip().split()
+            if len(fields) < 8 or not fields[0].isdigit():
+                continue
+
+            try:
+                # Standard X-Plane .fms entries end with identifier,
+                # latitude, longitude and altitude.
+                entries.append({
+                    "latitude": float(fields[-3]),
+                    "longitude": float(fields[-2]),
+                    "altitude": int(float(fields[-1]))
+                })
+            except ValueError:
+                continue
+
+    if not entries:
+        raise ValueError("The FMS file contains no valid entries")
+    return entries
+
+
+def load_fms_file_from_xplane(filename):
+    if os.path.basename(filename) != filename:
+        raise ValueError("Invalid FMS filename")
+
+    path = os.path.realpath(os.path.join(fms_directory(), filename))
+    directory = os.path.realpath(fms_directory())
+    if os.path.commonpath([path, directory]) != directory:
+        raise ValueError("Invalid FMS filename")
+    if not os.path.isfile(path) or not filename.lower().endswith(".fms"):
+        raise FileNotFoundError(filename)
+
+    with open(path, "rb") as fms_file:
+        plan_data = fms_file.read()
+
+    load_fms = getattr(xp, "loadFMSFlightPlan", None)
+    if load_fms is not None:
+        load_fms(0, plan_data, len(plan_data))
+        return {
+            "loaded": True,
+            "file": filename
+        }
+
+    # Older XPPython3 builds may not expose XPLMLoadFMSFlightPlan.
+    # Keep a limited lat/lon fallback for those installations.
+    entries = parse_fms_file(path)
+    current_count = xp.countFMSEntries()
+    for index in range(current_count - 1, -1, -1):
+        xp.clearFMSEntry(index)
+
+    for index, entry in enumerate(entries):
+        xp.setFMSEntryLatLon(
+            index,
+            entry["latitude"],
+            entry["longitude"],
+            entry["altitude"]
+        )
+
+    return {
+        "loaded": True,
+        "file": filename,
+        "count": len(entries)
+    }
+
+
+def submit_xplane_request(function):
+    request = XPlaneRequest(function)
+    try:
+        xplane_requests.put(request, timeout=XPLANE_REQUEST_TIMEOUT)
+    except queue.Full:
+        raise RuntimeError("X-Plane request queue is full")
+
+    try:
+        result = request.response.get(timeout=XPLANE_REQUEST_TIMEOUT)
+    except queue.Empty:
+        raise TimeoutError("X-Plane did not process the request in time")
+
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
 # ============================================================
 # X-Plane flight loop
 # ============================================================
@@ -171,26 +246,23 @@ def fms_update_callback(
         counter,
         refcon):
 
-    try:
-        # IMPORTANT:
-        #
-        # This code executes from X-Plane's flight loop.
-        #
-        # Therefore it is the ONLY place where we access
-        # the X-Plane FMS API.
-        data = read_fms_from_xplane()
+    global processed_request_count
+    while True:
+        try:
+            request = xplane_requests.get_nowait()
+        except queue.Empty:
+            break
 
-        # After X-Plane API calls are finished we put only
-        # normal Python data into the shared cache.
-        fms_cache.update(data)
+        try:
+            request.response.put(request.function())
+        except Exception as e:
+            request.response.put(e)
+            xp.log(
+                "[FMS Web Server] "
+                "X-Plane request error: {}".format(e)
+            )
+        processed_request_count += 1
 
-    except Exception as e:
-        xp.log(
-            "[FMS Web Server] "
-            "FMS update error: {}".format(e)
-        )
-
-    # Call again after FMS_UPDATE_INTERVAL seconds.
     return FMS_UPDATE_INTERVAL
 
 
@@ -242,6 +314,19 @@ class FMSRequestHandler(BaseHTTPRequestHandler):
             body
         )
 
+    def request_from_xplane(self, function):
+        try:
+            return submit_xplane_request(function)
+        except FileNotFoundError:
+            self.send_json({"error": "fms_file_not_found"}, status=404)
+        except (ValueError, TypeError) as e:
+            self.send_json({"error": "invalid_request", "message": str(e)},
+                           status=400)
+        except (RuntimeError, TimeoutError) as e:
+            self.send_json({"error": "xplane_unavailable", "message": str(e)},
+                           status=503)
+        return None
+
     # --------------------------------------------------------
     # GET
     # --------------------------------------------------------
@@ -268,7 +353,9 @@ class FMSRequestHandler(BaseHTTPRequestHandler):
                 "endpoints": [
                     "GET /",
                     "GET /health",
-                    "GET /fms"
+                    "GET /fms",
+                    "GET /fms/files",
+                    "POST /fms/load"
                 ]
             })
             return
@@ -279,9 +366,12 @@ class FMSRequestHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json({
                 "status": "ok",
-
                 "cache_version":
-                    fms_cache.version()
+                    processed_request_count,
+                "pending_requests":
+                    xplane_requests.qsize(),
+                "processed_requests":
+                    processed_request_count
             })
             return
 
@@ -289,15 +379,17 @@ class FMSRequestHandler(BaseHTTPRequestHandler):
         # /fms
         # ----------------------------------------------------
         if path == "/fms":
-            # IMPORTANT:
-            #
-            # There are NO xp.* calls here.
-            #
-            # HTTP thread only reads the Python cache.
-            data = fms_cache.get()
-            self.send_json(
-                data
+            data = self.request_from_xplane(read_fms_from_xplane)
+            if data is not None:
+                self.send_json(data)
+            return
+
+        if path == "/fms/files":
+            data = self.request_from_xplane(
+                get_fms_files_from_xplane
             )
+            if data is not None:
+                self.send_json(data)
             return
 
         # ----------------------------------------------------
@@ -310,6 +402,37 @@ class FMSRequestHandler(BaseHTTPRequestHandler):
             },
             status=404
         )
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/fms/load":
+            self.send_json({"error": "not_found"}, status=404)
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_json({"error": "invalid_content_length"}, status=400)
+            return
+        if content_length <= 0 or content_length > MAX_HTTP_BODY_SIZE:
+            self.send_json({"error": "invalid_body_size"}, status=400)
+            return
+
+        try:
+            body = self.rfile.read(content_length)
+            payload = json.loads(body.decode("utf-8"))
+            filename = payload["file"]
+            if not isinstance(filename, str):
+                raise TypeError("file must be a string")
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            self.send_json({"error": "invalid_json"}, status=400)
+            return
+
+        result = self.request_from_xplane(
+            partial(load_fms_file_from_xplane, filename)
+        )
+        if result is not None:
+            self.send_json(result)
 
 # ============================================================
 # HTTP server
@@ -430,24 +553,6 @@ class PythonInterface:
         )
 
         # --------------------------------------------------------
-        # Initial FMS snapshot
-        #
-        # XPluginStart executes in the X-Plane plugin context,
-        # so it is safe to initialize the cache here.
-        # --------------------------------------------------------
-        try:
-            initial_fms = (
-                read_fms_from_xplane()
-            )
-            fms_cache.update(
-                initial_fms
-            )
-        except Exception as e:
-            xp.log(
-                "[FMS Web Server] "
-                "Initial FMS read failed: {}".format(e)
-            )
-        # --------------------------------------------------------
         # Register flight loop
         # --------------------------------------------------------
         xp.registerFlightLoopCallback(
@@ -459,9 +564,6 @@ class PythonInterface:
         # --------------------------------------------------------
         # Start HTTP server
         #
-        # IMPORTANT:
-        #
-        # No X-Plane API calls are made from the HTTP thread.
         # --------------------------------------------------------
         try:
             start_http_server()
