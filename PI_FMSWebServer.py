@@ -30,7 +30,7 @@ from XPPython3 import xp
 # ============================================================
 # Configuration
 # ============================================================
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8201
 
 # How often to service requests from the HTTP thread.
